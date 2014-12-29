@@ -16,7 +16,6 @@ import (
 	"time"
 
 	log "github.com/Sirupsen/logrus"
-	"github.com/mitchellh/mapstructure"
 )
 
 // Main type for interacting with Kodi
@@ -69,20 +68,14 @@ type rpcResponse struct {
 	JsonRPC string                  `json:"jsonrpc"`
 	Method  *string                 `json:"method"`
 	Params  *map[string]interface{} `json:"params"`
-	Result  *map[string]interface{} `json:"result"`
+	Result  json.RawMessage         `json:"result"`
 	Error   *rpcError               `json:"error"`
 }
 
 // Notification stores Kodi server->client notifications.
 type Notification struct {
-	Method string `json:"method" mapstructure:"method"`
-	Params struct {
-		Data struct {
-			Item *struct {
-				Type string `json:"type" mapstructure:"type"`
-			} `json:"item" mapstructure:"item"` // Optional
-		} `json:"data" mapstructure:"data"`
-	} `json:"params" mapstructure:"params"`
+	Method string          `json:"method"`
+	Params json.RawMessage `json:"params"`
 }
 
 const (
@@ -132,7 +125,7 @@ func SetLogLevel(level log.Level) {
 // Return the result and any errors from the response channel
 // If timeout (seconds) is greater than zero, read will fail if not returned
 // within this time.
-func (rchan *Response) Read(timeout time.Duration) (result map[string]interface{}, err error) {
+func (rchan *Response) Read(result interface{}, timeout time.Duration) error {
 	rchan.readLock.Lock()
 	defer close(*rchan.channel)
 	defer func() {
@@ -141,10 +134,10 @@ func (rchan *Response) Read(timeout time.Duration) (result map[string]interface{
 	defer rchan.readLock.Unlock()
 
 	if rchan.Pending != true {
-		return result, errors.New(`No pending responses!`)
+		return errors.New(`No pending responses!`)
 	}
 	if rchan.channel == nil {
-		return result, errors.New(`Expected response channel, but got nil!`)
+		return errors.New(`Expected response channel, but got nil!`)
 	}
 
 	res := new(rpcResponse)
@@ -152,31 +145,35 @@ func (rchan *Response) Read(timeout time.Duration) (result map[string]interface{
 		select {
 		case res = <-*rchan.channel:
 		case <-time.After(timeout * time.Second):
-			return result, errors.New(`Timeout waiting on response channel`)
+			return errors.New(`Timeout waiting on response channel`)
 		}
 	} else {
 		res = <-*rchan.channel
 	}
 	if res == nil {
-		return result, errors.New(`Empty result received`)
+		return errors.New(`Empty result received`)
 	}
-	result, err = res.unpack()
+	err := res.unpack(&result)
 
-	return result, err
+	return err
 }
 
 // Unpack the result and any errors from the Response
-func (res *rpcResponse) unpack() (result map[string]interface{}, err error) {
+func (res *rpcResponse) unpack(result interface{}) (err error) {
 	if res.Error != nil {
 		err = errors.New(fmt.Sprintf(
 			`Kodi error (%v): %v`, res.Error.Code, res.Error.Message,
 		))
 	} else if res.Result != nil {
-		result = *res.Result
+		err = json.Unmarshal([]byte(res.Result), result)
 	} else {
 		log.WithField(`response`, res).Debug(`Received unknown response type from Kodi`)
 	}
-	return result, err
+	return err
+}
+
+func (n *Notification) Read(result interface{}) error {
+	return json.Unmarshal([]byte(n.Params), result)
 }
 
 // init brings up an instance of the Kodi Connection
@@ -203,11 +200,14 @@ func (c *Connection) init(address string, timeout time.Duration) (err error) {
 
 	rchan := c.Send(Request{Method: `JSONRPC.Version`}, true)
 
-	res, err := rchan.Read(c.timeout)
+	var res map[string]interface{}
+
+	err = rchan.Read(&res, c.timeout)
 	if err != nil {
 		log.WithField(`error`, err).Error(`Kodi responded`)
 		return err
 	}
+
 	if version := res[`version`].(map[string]interface{}); version != nil {
 		if version[`major`].(float64) < KODI_MIN_VERSION {
 			return errors.New(`Kodi version too low, upgrade to Frodo or later`)
@@ -222,6 +222,7 @@ func (c *Connection) init(address string, timeout time.Duration) (err error) {
 // false (for fire-and-forget commands that don't return any useful response).
 func (c *Connection) Send(req Request, want_response bool) Response {
 	req.JsonRPC = `2.0`
+
 	res := Response{}
 
 	c.writeWait.Add(1)
@@ -344,13 +345,14 @@ func (c *Connection) reader() {
 			log.WithField(`response.Method`, *res.Method).Debug(`Received notification from Kodi`)
 			n := Notification{}
 			n.Method = *res.Method
-			mapstructure.Decode(res.Params, &n.Params)
+			js, _ := json.Marshal(*res.Params)
+			n.Params = json.RawMessage(js)
 			c.Notifications <- n
 			c.notificationWait.Done()
 		} else if res.Id != nil {
 			if ch := c.responses[uint32(*res.Id)]; ch != nil {
 				if res.Result != nil {
-					log.WithField(`response.Result`, *res.Result).Debug(`Received response from Kodi`)
+					log.WithField(`response.Result`, res.Result).Debug(`Received response from Kodi`)
 				}
 				*ch <- res
 			} else {
